@@ -674,6 +674,7 @@ export const RunCommand = effectCmd({
           process.exit(1)
         }
         const sessionID = sess.id
+        const sessionTitle = sess.title
 
         function emit(type: string, data: Record<string, unknown>) {
           if (args.format === "json") {
@@ -803,6 +804,9 @@ export const RunCommand = effectCmd({
               if (!sessions.has(permission.sessionID)) continue
 
               if (auto) {
+                // A server holding our lease resolved this without asking, so
+                // reaching here means it predates the lease endpoint.
+                if (lease) continue
                 await client.permission.reply({
                   requestID: permission.id,
                   reply: "once",
@@ -825,31 +829,75 @@ export const RunCommand = effectCmd({
         const cwd = args.attach ? (directory ?? sess.directory ?? (await current(sdk))) : (directory ?? root)
         const client = args.attach ? attachSDK(cwd) : sdk
 
-        // Validate agent if specified
-        const agent = await pickAgent(client)
+        // Auto mode belongs to the server so `permission.asked` keeps meaning "a
+        // human must answer". The lease covers this session and the subagent
+        // sessions it spawns, so an attached long-running server keeps asking for
+        // everything else. It also lapses on its own, so killing this process
+        // cannot leave that server in auto mode. Servers predating the endpoint
+        // return no lease and `loop` keeps replying client-side.
+        const lease = auto
+          ? await client.permission
+              .autoAcquire({ scope: { type: "session", sessionID } })
+              .then((result) => result.data)
+              .catch(() => undefined)
+          : undefined
+        const renewal = lease
+          ? setInterval(
+              () => void client.permission.autoRenew({ leaseID: lease.id }).catch(() => {}),
+              Math.max(1000, Math.floor(lease.ttl / 3)),
+            )
+          : undefined
+        renewal?.unref?.()
+        try {
+          return await body()
+        } finally {
+          if (renewal) clearInterval(renewal)
+          if (lease) await client.permission.autoRelease({ leaseID: lease.id }).catch(() => {})
+        }
 
-        await share(client, sessionID)
+        async function body() {
+          // Validate agent if specified
+          const agent = await pickAgent(client)
 
-        if (!interactive) {
-          const events = await client.event.subscribe()
-          const completed = loop(client, events).catch((e) => {
-            console.error(e)
-            process.exitCode = 1
-          })
-          async function finish() {
-            if (args.attach) return
-            const error = await completed
-            if (error) process.exitCode = 1
-          }
+          await share(client, sessionID)
 
-          if (args.command) {
-            const result = await client.session.command({
+          if (!interactive) {
+            const events = await client.event.subscribe()
+            const completed = loop(client, events).catch((e) => {
+              console.error(e)
+              process.exitCode = 1
+            })
+            async function finish() {
+              if (args.attach) return
+              const error = await completed
+              if (error) process.exitCode = 1
+            }
+
+            if (args.command) {
+              const result = await client.session.command({
+                sessionID,
+                agent,
+                model: args.model,
+                command: args.command,
+                arguments: message,
+                variant: args.variant,
+              })
+              if (result.error) {
+                if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
+                process.exitCode = 1
+                return
+              }
+              await finish()
+              return
+            }
+
+            const model = pick(args.model)
+            const result = await client.session.prompt({
               sessionID,
               agent,
-              model: args.model,
-              command: args.command,
-              arguments: message,
+              model,
               variant: args.variant,
+              parts: [...files, { type: "text", text: message }],
             })
             if (result.error) {
               if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
@@ -861,47 +909,31 @@ export const RunCommand = effectCmd({
           }
 
           const model = pick(args.model)
-          const result = await client.session.prompt({
-            sessionID,
-            agent,
-            model,
-            variant: args.variant,
-            parts: [...files, { type: "text", text: message }],
-          })
-          if (result.error) {
-            if (!emit("error", { error: result.error })) UI.error(formatRunError(result.error))
-            process.exitCode = 1
-            return
+          const { runInteractiveMode } = await import("./run/runtime")
+          try {
+            await runInteractiveMode({
+              sdk: client,
+              directory: cwd,
+              sessionID,
+              sessionTitle,
+              resume: Boolean(args.session || args.continue) && !args.fork,
+              replay,
+              replayLimit: args["replay-limit"],
+              agent,
+              model,
+              variant: args.variant,
+              files,
+              initialInput,
+              createSession: createFreshSession,
+              thinking,
+              backgroundSubagents: flags.experimentalBackgroundSubagents,
+              demo: args.demo,
+            })
+          } catch (error) {
+            dieInteractive(error)
           }
-          await finish()
           return
         }
-
-        const model = pick(args.model)
-        const { runInteractiveMode } = await import("./run/runtime")
-        try {
-          await runInteractiveMode({
-            sdk: client,
-            directory: cwd,
-            sessionID,
-            sessionTitle: sess.title,
-            resume: Boolean(args.session || args.continue) && !args.fork,
-            replay,
-            replayLimit: args["replay-limit"],
-            agent,
-            model,
-            variant: args.variant,
-            files,
-            initialInput,
-            createSession: createFreshSession,
-            thinking,
-            backgroundSubagents: flags.experimentalBackgroundSubagents,
-            demo: args.demo,
-          })
-        } catch (error) {
-          dieInteractive(error)
-        }
-        return
       }
 
       if (interactive && !args.attach && !args.session && !args.continue) {
